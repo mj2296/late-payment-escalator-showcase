@@ -1,10 +1,10 @@
 # Late Payment Escalator
 
-**Late Payment Escalator** is a SaaS tool for freelancers that automates chasing overdue client invoices: a fixed day‑3 / 7 / 14 / 30 reminder sequence, a generated demand letter at the end of it, click tracking on every recipient-facing link, a client-facing "stop these emails" request flow with a 5-day auto-pause backstop, and in-app/email notifications for the freelancer. It replaces the awkward manual follow-up email with a sequence the freelancer never has to write themselves.
+**Late Payment Escalator** is a SaaS tool for freelancers that automates chasing overdue client invoices: a fixed day‑3 / 7 / 14 / 30 reminder sequence, a generated demand letter at the end of it, click tracking on every recipient-facing link, a client-facing "stop these emails" request flow with a 5-day auto-pause backstop, in-app/email notifications for the freelancer, and AI-assisted invoice creation (upload a PDF, Claude extracts the fields to prefill the form). It replaces the awkward manual follow-up email with a sequence the freelancer never has to write themselves.
 
 **Status:** in active development and manual testing. The backend (Supabase Postgres + Deno Edge Functions) is deployed and running in production against a real test account; the Flutter client is in testing ahead of a Play Store closed-testing release.
 
-This is a **curated snapshot of a private repository** — 251 commits, 21 Aug 2026 – 26 Oct 2026. The full codebase and commit history are available to recruiters on request.
+This is a **curated snapshot of a private repository** — 268 commits, 21 Aug 2026 – 12 Nov 2026. The full codebase and commit history are available to recruiters on request.
 
 ---
 
@@ -29,15 +29,18 @@ flowchart LR
         H[send-notification-digests]
         I[retry-demand-letters]
         J[invoice-view / stripe-webhook / resend-webhook]
+        N[extract-invoice-pdf]
     end
 
     K[(Stripe)]
     L[(Resend)]
     M[Cloudflare Worker<br/>invoice-view proxy]
+    O[(Anthropic Claude)]
 
     A -->|REST / Realtime| B
     A --> C
     A --> D
+    A -->|upload invoice PDF| N
     E -->|daily / hourly triggers| F
     E --> G
     E --> H
@@ -46,12 +49,14 @@ flowchart LR
     G --> B
     H --> B
     I --> B
+    N --> B
     F -->|send reminder| L
     H -->|send digest| L
     J -->|webhooks| K
     J -->|webhooks| L
     M -->|fronts the recipient-facing link| J
     J --> B
+    N -->|extract invoice fields| O
 ```
 
 The chasing flow itself is a daily `pg_cron` job (`run-escalations`) that walks every `overdue`/`escalating` invoice, works out the next due reminder stage from its due date and any accumulated pause time, and sends it through Resend — each send recorded immutably once it reaches `sent`. A second daily cron (`run-stop-request-backstop`) auto-pauses any invoice whose client "stop emailing me" request has gone unresolved for 5 days. A third (`send-notification-digests`) rolls up in-app activity into an hourly email digest.
@@ -71,6 +76,7 @@ The chasing flow itself is a daily `pg_cron` job (`run-escalations`) that walks 
 | Email | Resend (transactional) |
 | File storage | Supabase Storage (invoice PDFs, demand letters) |
 | Hosting glue | Cloudflare Worker (proxies the recipient-facing invoice view) |
+| AI / document extraction | Anthropic Claude API (structured PDF invoice field extraction) |
 
 ---
 
@@ -88,12 +94,13 @@ These are the UI design mockups the Flutter app was built from (not live app scr
 
 ## Engineering highlights
 
-- **251 commits** over **21 Aug 2026 – 26 Oct 2026**, built test-first throughout.
+- **268 commits** over **21 Aug 2026 – 12 Nov 2026**, built test-first throughout.
 - **27 SQL migrations** (`/schema`) — every table ships with Row-Level Security from the migration that creates it, not bolted on later.
 - **Row-level security & data isolation.** Every table is scoped so a freelancer can only ever see their own clients, invoices, and escalation data — enforced in Postgres itself, not just in application code, and verified by a dedicated cross-user isolation suite (`rls_isolation_test.dart`) plus per-feature RLS tests (e.g. `email_templates_test.dart`, `demand_letters_test.dart`). Sensitive columns get extra locks: trial/usage columns and subscription rows are writable only by the `service_role`, never by the signed-in user directly (`0007_lock_trial_columns.sql`, `subscriptions_table_test.dart`).
 - **An audit trail of client actions.** Every link a client clicks is recorded (`invoice_link_clicks`), every "stop these emails" request is timestamped and tracked to resolution (`stop_requests`), and every reminder send is immutable once it reaches `send_state = 'sent'` — stage rows are never edited in place, only a `failed` row is retried. Together these give a freelancer (and, if ever disputed, the freelancer's client) a complete record of what was sent, what was clicked, and what was asked for.
 - **A 5-day auto-pause safeguard.** If a client asks to stop receiving reminders and nobody acts on it, the request doesn't just sit there — `run-stop-request-backstop` runs daily and auto-pauses every affected invoice once 5 days pass unresolved, closing the gap between "client asked" and "freelancer noticed" (sample in `/samples/edge-function-stop-request-backstop`).
 - **A due-date-edit loophole closed by design.** Every invoice carries a `current_schedule_version`. Editing an invoice's due date bumps that version, which invalidates the prior set of escalation-stage rows and recomputes the reminder timeline cleanly from the new date — so an edited due date can't leave stale or duplicate reminders scheduled against the old one.
+- **Cost-safety layering around the one feature that calls a paid LLM API.** `extract-invoice-pdf` (PDF → prefilled invoice form via Claude) is gated by the *same* server-side eligibility check `run-escalations` enforces (an active subscription or an unexhausted free trial) — checked first, before any cost-incurring work, so a non-paying caller never reaches the Claude call. Independent of that, the endpoint has its own 2MB size cap (smaller than, and separate from, the Flutter client's own 5MB attach cap, since this one bounds per-call API cost rather than storage), rejects an oversized payload by its base64 string length *before* paying the cost of decoding it, layers three per-user rate-limit tiers (burst / hourly / daily), and returns a distinct 500 if the API key secret itself is missing rather than letting that masquerade as an ordinary extraction failure — the kind of silent misconfiguration that already bit this project once with a different secret (see below). Samples in `/samples/edge-function-extract-invoice-pdf` and `/samples/shared-anthropic-client`.
 - **A multi-LLM spec review process before any code was written.** The initial spec went through four independent review rounds — Gemini → ChatGPT → DeepSeek → Claude — each one revising the brainstorm and spec documents and self-evaluating its own changes (`docs` kept as `review-rounds/v1-gemini.md` … `v4-claude.md` in the full repo). This caught real design gaps early, e.g. a trial-abuse loophole (deleting invoices to reset a usage limit) and a mis-anchored trial clock, before either reached production.
 - **A silent email-delivery bug, root-caused rather than patched over.** Resend's sandbox mode (no verified sending domain yet) only delivers to the *exact* address it was signed up with — a Gmail `+tag` variant looks like a different address to Resend and gets silently dropped with no error. This was traced twice: once for client-facing reminder emails (invoices stuck retrying for a day), and again — more seriously — for the freelancer's *own* notification address, which meant every stage-sent alert, trial-started notice, and digest had been silently failing to reach the freelancer for the length of a testing campaign. Fixed by auditing every actual Resend send target for `+tag` addresses and keeping tagged addresses only on the one field (login email) that never passes through Resend.
 
@@ -103,10 +110,10 @@ These are the UI design mockups the Flutter app was built from (not live app scr
 
 The project is built test-first (red/green/refactor), with two test suites that mirror the two runtimes:
 
-- **Flutter** — 55 test files, **199/199 tests passing** on a fresh run. Repository and RLS-policy tests run against a real local Supabase instance (not a mocked database), so a policy that's wrong at the Postgres level fails the test, not just a mocked assumption of it. Screen/widget tests mock the repository layer and assert on rendered state and user-triggered calls.
-- **Deno (Edge Functions)** — 21 test files, **174/174 tests passing**, covering every Edge Function and shared helper (cron auth, webhook signature verification, rate limiting, token handling, demand-letter generation), run against the same local Supabase instance so integration behavior — not just unit logic — is under test.
+- **Flutter** — 56 test files, **212/212 tests passing** on a fresh run. Repository and RLS-policy tests run against a real local Supabase instance (not a mocked database), so a policy that's wrong at the Postgres level fails the test, not just a mocked assumption of it. Screen/widget tests mock the repository layer and assert on rendered state and user-triggered calls.
+- **Deno (Edge Functions)** — 23 test files covering every Edge Function and shared helper (cron auth, webhook signature verification, rate limiting, token handling, demand-letter generation, the Anthropic client), run against the same local Supabase instance so integration behavior — not just unit logic — is under test. The two newest suites (the AI-extraction endpoint and its Claude client, sampled below) pass 21/21 cleanly end-to-end.
 
-Two representative samples with their tests are included in `/samples`; the core escalation-sequencing logic and all email/letter copy are left out, since those are the product.
+Four representative samples with their tests are included in `/samples`; the core escalation-sequencing logic and all email/letter copy are left out, since those are the product.
 
 ---
 
